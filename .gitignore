@@ -1,0 +1,27 @@
+# Local captures, analysis, recovered credentials and logs
+/captures/
+/data/
+/log/
+/.backups/
+/wordlists/
+/.wifi-record-number
+*.pcap
+*.pcapng
+*.cap
+*.22000
+*.potfile
+*.restore
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local secrets and editor files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
