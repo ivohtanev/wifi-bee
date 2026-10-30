@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interactive Wi-Fi recorder; run sudo ./wifi-console.py --owner USER."""
 import argparse
+import sys
 import json
 import curses
 import datetime as dt
@@ -20,7 +21,7 @@ import tempfile
 import threading
 import time
 
-from wifi_ui import guarded_ui, footer
+from wifi_ui import guarded_ui, footer, breadcrumb, navigation
 from wifi_hashcat import browse as browse_hashcat
 from wifi_wordlists import browse as browse_wordlists
 from wifi_live import LiveSummary, device_label, signal_label, auth_label
@@ -176,7 +177,8 @@ class Session:
             raise
         self.capture_state = {'prefix': self.prefix, 'destination': str(self.destination),
                               'pid': self.proc.pid, 'start_ticks': process_start(self.proc.pid),
-                              'uid': self.uid, 'created': time.time(), 'files': [], 'status': 'recording'}
+                              'uid': self.uid, 'created': time.time(), 'channel': self.channel,
+                              'files': [], 'status': 'recording'}
         atomic_json(self.temp / 'session.json', self.capture_state, self)
         pipe, events = self.proc.stderr, self.events
 
@@ -276,6 +278,9 @@ class Session:
             return
         try:
             writable_directory(self.destination, self)
+            if self.started is not None and 'monitor_seconds' not in self.capture_state:
+                self.capture_state['monitor_seconds'] = max(0, time.monotonic() - self.started)
+                self.capture_state['ended'] = time.time()
             self.capture_state['status'] = 'saving'
             known = {item['name'] for item in self.capture_state.get('pending', [])}
             pending = self.capture_state.setdefault('pending', [])
@@ -350,6 +355,11 @@ def recover_captures(screen, session):
 
 
 def write(screen, row, text, attr=0):
+    if row == 0:
+        text = breadcrumb(text)
+        width = screen.getmaxyx()[1]
+        if len(text) > width - 2:
+            text = '… ' + text[-max(1, width - 4):]
     height, width = screen.getmaxyx()
     if 0 <= row < height - 1 and width > 2:
         try:
@@ -358,6 +368,7 @@ def write(screen, row, text, attr=0):
             pass
 
 
+@navigation('Monitor › Избор на канал')
 def choose_channel(screen, session, normal, highlight):
     if session.running:
         raise RuntimeError('Спри записа преди смяна на канал.')
@@ -451,7 +462,7 @@ def ui(screen, session):
     while True:
         session.update()
         screen.erase()
-        write(screen, 0, 'Wi-Fi конзола • ↑/↓ избор • Enter • Q назад/изход', curses.A_BOLD)
+        write(screen, 0, 'Главно меню' if page == 'menu' else 'Главно меню › Monitor › ' + ('Без служебен шум' if session.filter_junk else 'Всички пакети') + (' › Сесия ' + session.prefix if session.prefix else ''), curses.A_BOLD)
         if page == 'menu':
             options = ['Всички пакети (dumpcap)', 'Всички без служебен шум', 'Анализ на записи', 'Hashcat', 'Речници — изтегляне', 'Изход']
             write(screen, 2, 'wifi_mon • двата режима са без презаписване')
@@ -524,6 +535,8 @@ def ui(screen, session):
                     if selected == 2:
                         browse_analysis(screen, session, write)
                         continue
+                    if session.radio is None and os.geteuid() != 0:
+                        raise RuntimeError('Офлайн режим: за monitor стартирай програмата без --offline.')
                     session.filter_junk = selected == 1
                     session.channel = current_channel(session.interface)
                     page, selected = 'capture', 0
@@ -543,15 +556,32 @@ def ui(screen, session):
                 message = str(exc)
 
 
+
+def ensure_radio_privileges(session, offline=False):
+    """Re-enter the existing root-broker startup, never run the UI as root."""
+    if os.geteuid() == 0:
+        return
+    if session.uid != os.getuid():
+        raise SystemExit('--owner трябва да е текущият потребител.')
+    if offline:
+        return
+    sudo = shutil.which('sudo')
+    if not sudo:
+        raise SystemExit('За monitor е нужен sudo. За анализ без радио: --offline')
+    print('За смяна на канал и monitor запис са нужни права за радиото (sudo).', flush=True)
+    os.execv(sudo, [sudo, '--', sys.executable, str(Path(__file__).resolve()), '--owner', session.owner])
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description='Интерактивен Wi-Fi запис с dumpcap')
     parser.add_argument('--owner', help='Собственик на записите; по подразбиране собственикът на работната папка')
+    parser.add_argument('--offline', action='store_true', help='Само офлайн анализи, без права за радиото')
     args = parser.parse_args()
     if any(not shutil.which(tool) for tool in ('dumpcap', 'iw', 'systemd-inhibit')):
         raise SystemExit('Нужни са dumpcap, iw и systemd-inhibit.')
     locale.setlocale(locale.LC_ALL, '')
     session = Session(owner=args.owner)
+    ensure_radio_privileges(session, offline=args.offline)
     if os.geteuid() == 0:
         if not Path('/usr/bin/setpriv').is_file():
             raise SystemExit('Нужен е setpriv от util-linux за ограничените capture права.')

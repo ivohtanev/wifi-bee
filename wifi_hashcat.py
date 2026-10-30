@@ -1,3 +1,4 @@
+from wifi_ui import navigation, capture_location, breadcrumb
 """Dictionary and installed-mask runs over verified WPA 22000 exports."""
 import curses
 import datetime as dt
@@ -277,6 +278,7 @@ def draw_run(screen, write, metadata, status, reader, results, job):
     screen.refresh()
 
 
+@navigation(lambda a: 'Проверка › Набор ' + a['folder'].name + (' › Задача ' + a['resume_job'].name if a['resume_job'] else ''))
 def execute(screen, session, write, folder, dictionary, resume_job=None, attack_mode=0, prevent_sleep=False):
     if attack_mode not in (0, 3):
         raise ValueError('Неподдържан режим на проверка.')
@@ -502,6 +504,7 @@ def execute(screen, session, write, folder, dictionary, resume_job=None, attack_
             'История: ' + str(job / 'run.json')])
 
 
+@navigation('Hashcat')
 def browse(screen, session, write):
     base = session.destination.parent
     while True:
@@ -533,7 +536,7 @@ def browse(screen, session, write):
                     elif action == 2:
                         result_path = Path(record['results'])
                         recovered = result_snapshot(result_path) if result_path.exists() else []
-                        select(screen, 'Намерени пароли • потвърдени срещу WPA записа',
+                        select(screen, 'Задача ' + record['id'] + ' › Намерени пароли • потвърдени срещу WPA записа',
                                [display_plain(line) for line in recovered] or ['Няма намерени пароли'], write,
                                ['Пълен файл: ' + str(result_path),
                                 'Показани са последните записи; файлът запазва всички.'])
@@ -546,7 +549,7 @@ def browse(screen, session, write):
             masks = builtin_masks(base, session) + installed_masks()
             labels = [dictionary_label(p) for p in available]
             labels += [label for path, label in masks]
-            idx = select(screen, 'Избери речник или автоматични комбинации',
+            idx = select(screen, 'Набор ' + folder.name + ' › Избери речник или автоматични комбинации',
                          labels + ['Въведи път до речник'], write,
                          ['Речник: проверява думите от файла. Маска: генерира комбинации без речник.',
                           'Цифрови маски и инсталирани шаблони на hashcat.',
@@ -568,7 +571,7 @@ def browse(screen, session, write):
                     continue
             prevent_sleep = False
             while True:
-                preparation = select(screen, 'Подготовка на проверката', ['Назад', 'Старт', 'Без заспиване: ' + ('ДА' if prevent_sleep else 'НЕ')], write,
+                preparation = select(screen, 'Набор ' + folder.name + ' › Подготовка на проверката', ['Назад', 'Старт', 'Без заспиване: ' + ('ДА' if prevent_sleep else 'НЕ')], write,
                       ['Режим 22000 • ' + ('маска (генерирани комбинации)' if attack_mode == 3 else 'речник') + ' • ниско натоварване (-w 1)',
                        'Съвпадение потвърждава WPA записа, не текущата парола на рутера.',
                        'Спира след всички намерени записи или изчерпване на кандидатите.',
@@ -637,7 +640,15 @@ def history_label(path):
         state = {'finished': 'Завършена', 'stopped': 'Спряна', 'running': 'Стартирана',
                  'error': 'Грешка', 'interrupted': 'Прекъсната'}.get(record['status'], record['status'])
         checkpoint = '★ ' if (path.parent / 'hashcat.restore').is_file() else ''
-        return f'{checkpoint}{date} • {state} • ' + Path(record.get('original_dictionary', record['dictionary'])).name + f' • намерени: {record.get("recovered", 0)}'
+        dataset = Path(record.get('dataset') or '').name or record.get('source_id')
+        if not dataset:
+            manifest = path.parent / 'source-manifest.json'
+            try:
+                dataset = json.loads(manifest.read_text()).get('id')
+            except (OSError, ValueError):
+                pass
+        dataset = dataset or 'неизвестен'
+        return f'{checkpoint}{date} • Набор {dataset} • {state} • ' + Path(record.get('original_dictionary', record['dictionary'])).name + f' • намерени: {record.get("recovered", 0)}'
     except (OSError, ValueError, KeyError):
         return path.parent.name + ' • нечетима история'
 
@@ -688,9 +699,11 @@ def mask_length(pattern):
     return len(re.findall(rb'\?.|[^?]', mask.encode('utf-8')))
 
 
+@navigation(lambda a: 'Готови набори' + (' › Архив' if a['archived'] else ''))
 def choose_dataset(screen, session, write, archived=False):
     base = session.destination.parent
     root = archive_folder(base, 'ready', session) if archived else base / 'data' / 'ready'
+    cursor = 0
     while True:
         datasets = sorted(root.glob('*/manifest.json'))
         labels = []
@@ -703,8 +716,11 @@ def choose_dataset(screen, session, write, archived=False):
         choice = select(screen, 'Готови набори' + (' • архив' if archived else ''),
                         labels + ['Назад'] + ([] if archived else ['Архив']), write,
                         ['A: ' + ('възстанови избрания набор' if archived else 'архивирай избрания набор веднага; K отваря Архив'),
-                         'Архивирането запазва задачите, резултатите и checkpoint-ите.'], hotkeys=ARCHIVE_KEYS)
+                         'Архивирането запазва задачите, резултатите и checkpoint-ите.'], hotkeys=ARCHIVE_KEYS,
+                        initial_selected=min(cursor, max(0, len(datasets) - 1)))
         action, selected = choice if isinstance(choice, tuple) else ('open', choice)
+        if selected is not None:
+            cursor = selected
         if action == 'open_archive':
             if not archived:
                 chosen = choose_dataset(screen, session, write, archived=True)

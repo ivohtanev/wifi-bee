@@ -70,7 +70,7 @@ class ConfirmScreen:
                 visible = max(1, height - 3)
                 offset = min(offset, max(0, len(lines) - visible))
                 if width > 2 and height > 1:
-                    self.screen.addnstr(0, 1, 'Помощ • възстановяване на Wi-Fi парола', width - 2, curses.A_BOLD)
+                    self.screen.addnstr(0, 1, breadcrumb('Помощ • възстановяване на Wi-Fi парола'), width - 2, curses.A_BOLD)
                 for row, line in enumerate(lines[offset:offset + visible], 1):
                     if row < height - 1 and width > 2:
                         self.screen.addnstr(row, 1, line, width - 2)
@@ -129,7 +129,7 @@ class ConfirmScreen:
         while True:
             screen.erase()
             height, width = screen.getmaxyx()
-            lines = ['Да спра ли програмата?',
+            lines = [breadcrumb('Да спра ли програмата?'),
                      'Активните задачи ще бъдат спрени, записите ще се запазят.',
                      'Enter потвърждава избора • Esc / Ctrl+C = Не',
                      ('▶ ' if selected == 0 else '  ') + '[1] Не — продължи',
@@ -198,3 +198,45 @@ def help_steps(session=None):
         '7. При нужда продължи. „Hashcat“ → „Предишни задачи / резултати / възобновяване“ → задача → „Покажи намерени пароли“ или „Възобнови от checkpoint“. Възобновяване е възможно само при наличен checkpoint и непроменени входни файлове.',
         'H/h отваря тази помощ. В полето за път използвай главно H или F1 за помощ; малко h се въвежда като текст. Помощта не спира текущото записване, анализ, изтегляне или hashcat. Q/Esc затваря помощта и връща към същия екран.'
     ]
+
+
+# Context-local navigation is restored even when a dialog fails or is cancelled.
+from contextvars import ContextVar
+from functools import wraps
+from inspect import signature
+
+_navigation = ContextVar('wifi_navigation', default=())
+
+
+def breadcrumb(title):
+    parts = ['Главно меню', *_navigation.get()]
+    title = ''.join(c if c.isprintable() else ' ' for c in str(title))
+    if title.startswith('Главно меню'):
+        return title
+    if title and title != parts[-1]:
+        parts.append(title)
+    return ' › '.join(parts)
+
+
+def navigation(label):
+    """Scope a screen's location; callable labels receive bound arguments."""
+    def decorate(function):
+        sig = signature(function)
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            arguments = sig.bind(*args, **kwargs)
+            arguments.apply_defaults()
+            value = label(arguments.arguments) if callable(label) else label
+            token = _navigation.set((*_navigation.get(), str(value)))
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _navigation.reset(token)
+        return wrapped
+    return decorate
+
+
+def capture_location(arguments):
+    paths = arguments['paths']
+    numbers = sorted({p.name.split('_')[0] for p in paths})
+    return 'Сесия ' + ', '.join(numbers) + (' • архив' if arguments.get('archived') else '')

@@ -1,3 +1,4 @@
+from wifi_ui import navigation, capture_location, breadcrumb
 """Pinned, verified wordlist downloads. No downloaded code or archives are executed."""
 import curses
 import datetime as dt
@@ -170,6 +171,7 @@ def manual_instructions(entry, folder):
             '\nНекомпресирани .txt/.dic/.lst/.wordlist файлове се показват в Hashcat → Избери речник.\n')
 
 
+@navigation(lambda a: 'Изтегляне › ' + a['entry']['id'])
 def download(screen, session, write, entry):
     base = session.destination.parent
     folder = base / 'wordlists'
@@ -246,6 +248,7 @@ def download(screen, session, write, entry):
                 'SHA-256 проверен. Достъпен в Hashcat → Нова проверка.'])
 
 
+@navigation('Речници')
 def browse(screen, session, write):
     base = session.destination.parent
     while True:
