@@ -76,5 +76,14 @@ Hashcat reports cryptographic matches against the recorded WPA data, not specula
 password scores. Matches are shown and saved immediately. For multiple hashes it
 continues until all are recovered or the dictionary is exhausted. A match does not
 establish that the router still has the same password. Candidate guesses are not
-saved as recovered passwords. S/Q/Escape asks before stopping; Ctrl+C uses the shared
+saved as recovered passwords. C/Q/Escape asks before saving and stopping; Ctrl+C uses the shared
 exit confirmation. Keep the complete job directory to preserve both results and resume.
+
+
+### Промени след review от 30.10.2026
+
+При Stop фоновите tshark/hcx процеси се прекратяват и прибират преди местенето. Скоростта на запис се показва в MiB/s; изгубените пакети са „н/д“, когато dumpcap не предоставя брояч. Готовността е „наблюдавано в сесията“, с възраст на проверката, а не текуща свързаност.
+
+Capture staging вече има `session.json`. Прибирането публикува проверени копия без презаписване; след отказ се повтарят само незавършените операции. Следващ старт предлага възстановяване на сесиите с журнал и спрян процес. Папки от старата версия без журнал не се прибират автоматично.
+
+K отваря архива, A архивира избраното; в архива A връща обратно. Архивираните файлове са извън автоматичната проверка за готовност. [Извлечени] следва съдържанието, включително когато готовият набор е архивиран.

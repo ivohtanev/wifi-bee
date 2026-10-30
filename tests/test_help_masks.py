@@ -15,6 +15,11 @@ from wifi_hashcat import execute, installed_masks, resume_command, text_input
 
 
 class HelpAndMasks(unittest.TestCase):
+    def setUp(self):
+        patcher = patch('wifi_hashcat.tool_environment', return_value={'hashcat': 'test'})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_help_returns_to_original_controls_and_scrolls(self):
         raw = Screen([ord('h'), curses.KEY_NPAGE, curses.KEY_END, curses.KEY_HOME, ord('q'), 10])
         raw.addnstr = Mock()
@@ -90,10 +95,13 @@ class HelpAndMasks(unittest.TestCase):
             metadata_path = next((base/'data/hashcat').glob('*/run.json'))
             record = json.loads(metadata_path.read_text())
             self.assertEqual(record['attack_mode'], 3)
-            (metadata_path.parent/'hashcat.restore').write_bytes(b'checkpoint')
+            fixtures.write_restore(metadata_path.parent/'hashcat.restore', metadata_path.parent, command)
             with patch('wifi_hashcat.subprocess.run', return_value=types.SimpleNamespace(stdout='--restore-position')):
                 self.assertEqual(resume_command(record, metadata_path.parent), command + ['--restore-position'])
                 mask.write_text('changed')
+                self.assertEqual(resume_command(record, metadata_path.parent), command + ['--restore-position'])
+                Path(record['dictionary']).chmod(0o600)
+                Path(record['dictionary']).write_text('changed snapshot')
                 with self.assertRaises(ValueError): resume_command(record, metadata_path.parent)
 
 

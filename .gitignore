@@ -1,5 +1,6 @@
 # Local captures, analysis, recovered credentials and logs
 /captures/
+/archive/
 /data/
 /log/
 /.backups/

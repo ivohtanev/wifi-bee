@@ -2,6 +2,7 @@ import curses
 import hashlib
 import json
 import os
+import struct
 from pathlib import Path
 import tempfile
 import types
@@ -10,6 +11,15 @@ from unittest.mock import Mock, patch
 
 from wifi_ui import ConfirmScreen
 from wifi_hashcat import load_dataset, execute, explain
+
+
+def write_restore(path, job, command):
+    header = bytearray(296)
+    struct.pack_into('<I', header, 0, 600)
+    cwd = str(job).encode()
+    header[4:4 + len(cwd)] = cwd
+    struct.pack_into('<I', header, 280, len(command))
+    path.write_bytes(header + ('\n'.join(command) + '\n').encode())
 
 
 class Screen:
@@ -24,6 +34,11 @@ class Screen:
 
 
 class Features(unittest.TestCase):
+    def setUp(self):
+        patcher = patch('wifi_hashcat.tool_environment', return_value={'hashcat': 'test'})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_interrupt_default_no(self):
         screen = ConfirmScreen(Screen([-1, 10]))
         screen.pending = True
@@ -68,7 +83,8 @@ class Features(unittest.TestCase):
                 execute(Screen([]), session, lambda *a: None, folder, dictionary)
             command = popen.call_args.args[0]
             self.assertNotIn('--force', command)
-            self.assertIn(str(dictionary), command)
+            self.assertEqual(Path(command[-1]).read_text(), dictionary.read_text())
+            self.assertEqual(Path(command[-1]).name, 'candidates.txt')
             run = json.loads(next((base/'data/hashcat').glob('*/run.json')).read_text())
             self.assertEqual(run['returncode'], 1)
             self.assertEqual(run['status'], 'finished')

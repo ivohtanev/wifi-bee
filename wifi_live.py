@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from wifi_process import Processes
 
 
 def readable(value):
@@ -33,14 +34,14 @@ def auth_label(counts):
     return ' '.join(f'{key}:{counts[key]}' for key in keys if counts[key]) or 'без auth'
 
 
-def summarize(path):
+def summarize(path, processes=None):
     devices = {}
     command = ['tshark', '-r', str(path), '-T', 'fields', '-E', 'occurrence=f',
                '-e', 'wlan.ta', '-e', 'wlan.fc.type_subtype', '-e', 'eapol.type',
                '-e', 'wlan_rsna_eapol.keydes.msgnr', '-e', 'radiotap.dbm_antsignal',
                '-e', 'wlan.ssid', '-e', 'wps.device_name']
     with tempfile.TemporaryFile(mode='w+') as errors:
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True)
+        proc = (processes.popen if processes else subprocess.Popen)(command, stdout=subprocess.PIPE, stderr=errors, text=True)
         timer = threading.Timer(90, proc.kill)
         timer.start()
         try:
@@ -96,6 +97,8 @@ def summarize(path):
                 proc.kill()
             proc.wait()
             proc.stdout.close()
+            if processes:
+                processes.release(proc)
     return devices
 
 
@@ -105,6 +108,7 @@ class LiveSummary:
         self.snapshot = ({}, set(), 'Изчакване на статистика…')
         self.closed = {}
         self.stop_event = threading.Event()
+        self.processes = Processes()
         self.thread = threading.Thread(target=self.work, daemon=True)
         self.thread.start()
 
@@ -120,7 +124,7 @@ class LiveSummary:
                         return
                     data = self.closed.get(path.name)
                     if data is None:
-                        data = summarize(path)
+                        data = summarize(path, self.processes)
                         if path != paths[-1]:
                             self.closed[path.name] = data
                     for mac, counts in data.items():
@@ -129,7 +133,7 @@ class LiveSummary:
                 if paths and time.monotonic() - checked >= 120:
                     with tempfile.TemporaryDirectory(prefix='wifi-ready-') as temp:
                         out = Path(temp) / 'wpa.22000'
-                        result = subprocess.run(['hcxpcapngtool', '-o', str(out), *map(str, paths)],
+                        result = self.processes.run(['hcxpcapngtool', '-o', str(out), *map(str, paths)],
                                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=90)
                         if result.returncode:
                             logging.getLogger('wifi').error('hcxpcapngtool: %s', result.stderr)
@@ -140,7 +144,9 @@ class LiveSummary:
                                 if len(parts) >= 6 and parts[0] == 'WPA' and parts[1] in ('01', '02'):
                                     ready.add((parts[3].lower(), parts[4].lower()))
                     checked = time.monotonic()
-                self.snapshot = (totals, set(ready), status)
+                status += ' • готовност: наблюдавано в сесията; възраст ' + str(int(time.monotonic() - checked)) + ' s'
+                if not self.stop_event.is_set():
+                    self.snapshot = (totals, set(ready), status)
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 logging.getLogger('wifi').exception('Грешка при анализ')
                 old, accepted, _ = self.snapshot
@@ -149,4 +155,7 @@ class LiveSummary:
 
     def close(self):
         self.stop_event.set()
-        self.thread.join(timeout=1)
+        self.processes.close()
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            raise RuntimeError('Анализаторът не приключи; записите няма да се местят.')
