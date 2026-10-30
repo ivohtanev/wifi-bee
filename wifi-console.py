@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interactive Wi-Fi recorder; run sudo ./wifi-console.py --owner USER."""
 import argparse
+import json
 import curses
 import datetime as dt
 import fcntl
@@ -19,11 +20,14 @@ import tempfile
 import threading
 import time
 
-from wifi_ui import guarded_ui
+from wifi_ui import guarded_ui, footer
 from wifi_hashcat import browse as browse_hashcat
 from wifi_wordlists import browse as browse_wordlists
 from wifi_live import LiveSummary, device_label, signal_label, auth_label
-from wifi_analysis import browse as browse_analysis
+from wifi_analysis import browse as browse_analysis, select
+from wifi_storage import (atomic_json, check_space, durable_move, no_symlinks, secure,
+                          writable_directory, sync_directory, file_digest)
+from wifi_privilege import Radio, drop_privileges
 
 BASE = Path(__file__).resolve().parent
 LIMIT = 50000 * 1024
@@ -47,11 +51,11 @@ def size(value):
 
 
 def next_record_number():
-    with (BASE / '.wifi-record-number').open('a+') as handle:
+    with no_symlinks(BASE / '.wifi-record-number').open('a+') as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         handle.seek(0)
         old = handle.read().strip()
-        numbers = [int(m.group(1)) for p in (BASE / 'captures').glob('*.pcapng')
+        numbers = [int(m.group(1)) for root in (BASE / 'captures', BASE / 'archive' / 'captures') for p in root.glob('*.pcapng')
                    if (m := re.match(r'^(\d+)_', p.name))]
         number = max([int(old) if old else 0, *numbers]) + 1
         handle.seek(0)
@@ -108,6 +112,12 @@ class Session:
         self.events = queue.Queue()
         self.reader = None
         self.live = None
+        self.radio = None
+        self.disk_checked = 0
+        self.capture_state = {}
+        self.byte_rate = 0
+        self.byte_sample = (time.monotonic(), 0)
+        self.dropped = None
 
     @property
     def running(self):
@@ -120,15 +130,15 @@ class Session:
             self.finish()
             if not self.saved:
                 raise RuntimeError('Неприбран запис: ' + str(self.temp))
+        check_space(self.destination)
+        check_space(Path('/var/tmp'))
         channel_info = current_channel(self.interface)
         channel = re.match(r'(\d+)', channel_info)
         if not channel:
             raise RuntimeError('Не може да се установи текущият канал. Избери канал преди Старт.')
         self.channel = channel_info
         self.prefix = f'{next_record_number():06d}_ch-{channel[1]}_{stamp()}'
-        self.destination.mkdir(parents=True, exist_ok=True)
-        self.destination.chmod(0o700)
-        os.chown(self.destination, self.uid, self.gid)
+        writable_directory(self.destination, self)
         self.temp = Path(tempfile.mkdtemp(prefix='.recording-' + self.prefix + '-', dir='/var/tmp'))
         # dumpcap drops DAC override privileges: its staging directory must
         # remain owned by the launching uid, with a traversable parent.
@@ -139,6 +149,8 @@ class Session:
         self.rows, self.log = [], []
         self.events = queue.Queue()
         self.started = time.monotonic()
+        self.byte_sample = (self.started, 0)
+        self.dropped = None
         self.stop_requested = False
         cmd = ['dumpcap', '-i', self.interface, '-s', '0',
                '-b', f'filesize:{LIMIT // 1024}',
@@ -153,12 +165,19 @@ class Session:
                '--who=Wi-Fi console', '--why=Active Wi-Fi packet recording',
                '--no-ask-password', '--', *cmd]
         try:
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                         start_new_session=True, env={**os.environ, 'LC_ALL': 'C'})
+            if self.radio:
+                self.proc = self.radio.start(self.temp / (self.prefix + '.pcapng'), self.filter_junk)
+            else:
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                             start_new_session=True, env={**os.environ, 'LC_ALL': 'C'})
         except OSError:
             self.temp.rmdir()
             self.temp = None
             raise
+        self.capture_state = {'prefix': self.prefix, 'destination': str(self.destination),
+                              'pid': self.proc.pid, 'start_ticks': process_start(self.proc.pid),
+                              'uid': self.uid, 'created': time.time(), 'files': [], 'status': 'recording'}
+        atomic_json(self.temp / 'session.json', self.capture_state, self)
         pipe, events = self.proc.stderr, self.events
 
         def read_output():
@@ -180,6 +199,15 @@ class Session:
         self.live = LiveSummary(self.temp, self.prefix)
 
     def update(self):
+        if self.running and time.monotonic() - self.disk_checked >= 2:
+            self.disk_checked = time.monotonic()
+            try:
+                check_space(self.temp)
+                check_space(self.destination)
+            except OSError as exc:
+                self.error = str(exc) + ' • записът се спира; файловете се пазят.'
+                self.stop()
+                return
         # Drain final stderr after the reader has seen EOF, including fast failures.
         if self.proc and self.proc.poll() is not None and self.reader:
             self.reader.join(timeout=1)
@@ -188,6 +216,9 @@ class Session:
                 line = self.events.get_nowait().strip()
             except queue.Empty:
                 break
+            dropped = re.search(r'(?:Packets dropped|Dropped):\s*(\d+)', line, re.I)
+            if dropped:
+                self.dropped = int(dropped[1])
             match = re.search(r'Packets(?: captured)?:\s*(\d+)', line)
             if match or line.isdecimal():
                 self.packet_count = int(match[1] if match else line)
@@ -211,10 +242,19 @@ class Session:
                 except FileNotFoundError:
                     pass
 
+        current = sum(n for _, n in self.rows)
+        now, previous = self.byte_sample
+        elapsed = time.monotonic() - now
+        if elapsed >= 1:
+            self.byte_rate = max(0, current - previous) / elapsed
+            self.byte_sample = (time.monotonic(), current)
+
     def stop(self):
         self.stop_requested = True
         if self.live:
             self.live.close()
+        if self.running and self.radio:
+            self.proc.stop()
         if self.running:
             os.killpg(self.proc.pid, signal.SIGINT)
             try:
@@ -235,21 +275,78 @@ class Session:
         if not self.temp or self.saved or self.running:
             return
         try:
-            self.destination.mkdir(parents=True, exist_ok=True)
-            os.chown(self.destination, self.uid, self.gid)
-            self.destination.chmod(0o700)
-            for source in self.temp.glob('*.pcapng'):
-                target = self.destination / source.name
-                if target.exists():
-                    raise OSError('Съществува файл: ' + str(target))
-                shutil.move(str(source), str(target))
-                os.chown(target, self.uid, self.gid)
-                target.chmod(0o600)
-            shutil.rmtree(self.temp)
+            writable_directory(self.destination, self)
+            self.capture_state['status'] = 'saving'
+            known = {item['name'] for item in self.capture_state.get('pending', [])}
+            pending = self.capture_state.setdefault('pending', [])
+            for source in sorted(self.temp.glob('*.pcapng')):
+                if source.name not in known:
+                    pending.append({'name': source.name, 'bytes': source.stat().st_size, 'sha256': file_digest(source)})
+            atomic_json(self.temp / 'session.json', self.capture_state, self)
+            for item in list(pending):
+                name = item['name']
+                if Path(name).name != name or not name.endswith('.pcapng'):
+                    raise ValueError('Невалиден запис в recovery журнала.')
+                source, target = self.temp / name, self.destination / name
+                if source.exists():
+                    result = durable_move(source, target, self)
+                elif target.is_file() and file_digest(no_symlinks(target)) == item['sha256']:
+                    result = item
+                else:
+                    raise OSError('Липсва неприбраният запис: ' + name)
+                self.capture_state.setdefault('files', []).append(result)
+                pending.remove(item)
+                atomic_json(self.temp / 'session.json', self.capture_state, self)
+            self.capture_state['status'] = 'saved'
+            journal_dir = self.destination / '.sessions'
+            writable_directory(journal_dir, self)
+            atomic_json(journal_dir / (self.prefix + '.json'), self.capture_state, self)
+            (self.temp / 'session.json').unlink()
+            self.temp.rmdir()
+            sync_directory(self.temp.parent)
             self.saved = True
-        except OSError as exc:
+            if self.error.startswith('Неуспешно прибиране:'):
+                self.error = ''
+        except (OSError, ValueError) as exc:
             logging.getLogger('wifi').exception('Неуспешно прибиране на запис')
-            self.error = f'Неуспешно прибиране: {exc}. Оригиналите са в {self.temp}'
+            self.error = f'Неуспешно прибиране: {exc}. Неприбрани: {self.temp}; вече прибрани: {self.destination}. Опитай възстановяване.'
+
+
+def process_start(pid):
+    try:
+        return Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def abandoned_sessions(session):
+    found = []
+    for path in Path('/var/tmp').glob('.recording-*/session.json'):
+        try:
+            no_symlinks(path)
+            record = json.loads(path.read_text())
+            if record['uid'] != session.uid or Path(record['destination']) != session.destination:
+                continue
+            current = process_start(record['pid'])
+            if current is not None and (not record.get('start_ticks') or current == record['start_ticks']):
+                continue
+            if re.fullmatch(r'[A-Za-z0-9_.-]+', record['prefix']):
+                found.append((path.parent, record))
+        except (OSError, ValueError, KeyError):
+            continue
+    return found
+
+
+def recover_captures(screen, session):
+    for folder, record in abandoned_sessions(session):
+        choice = select(screen, 'Неприбрана capture сесия', ['Остави за по-късно', 'Възстанови записите'], write,
+                        [str(folder), 'Двигателят е спрян. Съществуващи различни файлове не се презаписват.'])
+        if choice == 1:
+            session.temp, session.prefix, session.capture_state = folder, record['prefix'], record
+            session.saved = False
+            session.finish()
+            if session.error:
+                select(screen, 'Възстановяване', ['Назад'], write, [session.error])
 
 
 def write(screen, row, text, attr=0):
@@ -278,8 +375,9 @@ def choose_channel(screen, session, normal, highlight):
         count = max(1, height - 6)
         first = max(0, selected - count + 1)
         for index in range(first, min(len(options), first + count)):
-            label = ('▶ ' if index == selected else '  ') + options[index]
+            label = ('▶ ' if index == selected else '  ') + f'[{index + 1}] ' + options[index]
             write(screen, 4 + index - first, label.ljust(max(0, width - 2)), highlight if index == selected else normal)
+        footer(screen, '↑/↓ избор • Enter избира канал • Q/Esc назад')
         screen.refresh()
         key = screen.getch()
         if key == curses.KEY_UP:
@@ -295,6 +393,7 @@ def choose_channel(screen, session, normal, highlight):
                 screen.erase()
                 write(screen, 1, 'Номер на канал (празно = отказ):')
                 write(screen, 3, 'Поддържани: ' + ', '.join(map(str, sorted(channels))))
+                footer(screen, 'Цифри: канал • Enter потвърждава • Esc отказ')
                 screen.timeout(-1)
                 curses.echo()
                 curses.curs_set(1)
@@ -311,6 +410,10 @@ def choose_channel(screen, session, normal, highlight):
                 channel = int(value)
             else:
                 channel = common[selected - 1]
+            if session.radio:
+                session.radio.request('channel', frequency=channels[channel])
+                session.channel = current_channel(session.interface)
+                return
             result = subprocess.run(['iw', 'dev', session.interface, 'set', 'freq', str(channels[channel])],
                                     capture_output=True, text=True, timeout=5)
             if result.returncode:
@@ -333,6 +436,7 @@ def ui(screen, session):
         curses.init_pair(2, curses.COLOR_WHITE, gray)
         normal, highlight = curses.color_pair(1), curses.color_pair(2) | curses.A_BOLD
         screen.bkgd(' ', normal)
+    recover_captures(screen, session)
     page, selected, message = 'menu', 0, ''
     device_offset = 0
     green = curses.A_BOLD
@@ -349,7 +453,7 @@ def ui(screen, session):
         screen.erase()
         write(screen, 0, 'Wi-Fi конзола • ↑/↓ избор • Enter • Q назад/изход', curses.A_BOLD)
         if page == 'menu':
-            options = ['1. Всички пакети (dumpcap)', '2. Всички без служебен шум', '3. Анализ на записи', '4. Hashcat', '5. Речници — изтегляне', 'Изход']
+            options = ['Всички пакети (dumpcap)', 'Всички без служебен шум', 'Анализ на записи', 'Hashcat', 'Речници — изтегляне', 'Изход']
             write(screen, 2, 'wifi_mon • двата режима са без презаписване')
             start_row = 4
         else:
@@ -365,12 +469,12 @@ def ui(screen, session):
             write(screen, 6, 'След Стоп → ' + str(session.destination))
             start_row = 8
         for index, label in enumerate(options):
-            label = ('▶ ' if selected == index else '  ') + label
+            label = ('▶ ' if selected == index else '  ') + f'[{index + 1}] ' + label
             write(screen, start_row + index, label.ljust(max(0, screen.getmaxyx()[1] - 2)),
                   highlight if selected == index else normal)
         if page == 'capture':
             height = screen.getmaxyx()[0]
-            write(screen, 13, f'Налични файлове: {len(session.rows)} • общ размер: {size(sum(n for _, n in session.rows))}')
+            write(screen, 13, f'Файлове: {len(session.rows)} • {size(sum(n for _, n in session.rows))} • {size(session.byte_rate)}/s • загубени: ' + (str(session.dropped) if session.dropped is not None else 'н/д'))
             free = shutil.disk_usage(session.temp if session.temp and session.temp.exists() else BASE).free
             write(screen, 14, 'Свободно на диска: ' + size(free))
             if session.live:
@@ -383,13 +487,15 @@ def ui(screen, session):
                     accepted = any(mac.replace(':', '').lower() in pair for pair in ready)
                     auth = auth_label(counts)
                     attr = green if accepted else normal
-                    label = f'{mac} • {signal_label(counts)} • {device_label(counts)}'
+                    label = f'[{device_offset + row + 1}] {mac} • {signal_label(counts)} • {device_label(counts)}'
                     write(screen, 16 + row * 2, label.ljust(max(0, screen.getmaxyx()[1] - 2)),
                           device_ready_bg if accepted else device_bg)
                     write(screen, 17 + row * 2, ('  └─ ГОТОВ (hcx) • ' if accepted else '  └─ ') +
                           f'{counts["packets"]} pkt • {auth}', attr)
                 write(screen, height - 4, status)
         write(screen, screen.getmaxyx()[0] - 3, session.error or message)
+        footer(screen, '↑/↓ избор • Enter избира • Q/Esc назад/изход' +
+               (' • PgUp/PgDn устройства' if page == 'capture' else ''))
         screen.refresh()
         key = screen.getch()
         if key in (curses.KEY_NPAGE, curses.KEY_PPAGE) and page == 'capture':
@@ -432,7 +538,7 @@ def ui(screen, session):
                 else:
                     session.stop()
                     page, selected = 'menu', 0
-            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 logging.getLogger('wifi').exception('Грешка в конзолата')
                 message = str(exc)
 
@@ -442,16 +548,27 @@ def main():
     parser = argparse.ArgumentParser(description='Интерактивен Wi-Fi запис с dumpcap')
     parser.add_argument('--owner', help='Собственик на записите; по подразбиране собственикът на работната папка')
     args = parser.parse_args()
-    if os.geteuid() != 0:
-        raise SystemExit('Стартирай с: sudo ./wifi-console.py --owner USER')
     if any(not shutil.which(tool) for tool in ('dumpcap', 'iw', 'systemd-inhibit')):
         raise SystemExit('Нужни са dumpcap, iw и systemd-inhibit.')
     locale.setlocale(locale.LC_ALL, '')
     session = Session(owner=args.owner)
+    if os.geteuid() == 0:
+        if not Path('/usr/bin/setpriv').is_file():
+            raise SystemExit('Нужен е setpriv от util-linux за ограничените capture права.')
+        account = pwd.getpwuid(session.uid)
+        if account.pw_uid == 0:
+            raise SystemExit('Нужен е обикновен собственик: --owner USER')
+        session.radio = Radio(account, session.interface)
+        try:
+            drop_privileges(account)
+        except BaseException:
+            session.radio.close()
+            raise
+    elif session.uid != os.getuid():
+        raise SystemExit('--owner трябва да е текущият потребител.')
     log_dir = BASE / 'log'
-    log_dir.mkdir(exist_ok=True, mode=0o700)
-    os.chown(log_dir, session.uid, session.gid)
-    log_path = log_dir / 'wifi-console.log'
+    writable_directory(log_dir, session)
+    log_path = no_symlinks(log_dir / 'wifi-console.log')
     handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding='utf-8')
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(threadName)s %(message)s'))
     logging.getLogger('wifi').setLevel(logging.INFO)
@@ -467,7 +584,11 @@ def main():
         logging.getLogger('wifi').exception('Неочаквана грешка')
         raise
     finally:
-        session.stop()
+        try:
+            session.stop()
+        finally:
+            if session.radio:
+                session.radio.close()
         if session.temp:
             print('Файлове: ' + str(session.destination if session.saved else session.temp))
         if session.error:

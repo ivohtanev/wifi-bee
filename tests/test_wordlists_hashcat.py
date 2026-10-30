@@ -10,7 +10,7 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
-from wifi_hashcat import StatusReader, display_plain, execute, resume_command
+from wifi_hashcat import StatusReader, display_plain, execute, resume_command, build_command
 from wifi_storage import atomic_json
 from wifi_wordlists import Cancelled, dictionaries, transfer
 import test_console_features as fixtures
@@ -70,6 +70,11 @@ class Downloads(unittest.TestCase):
 
 
 class TaskStorage(unittest.TestCase):
+    def setUp(self):
+        patcher = patch('wifi_hashcat.tool_environment', return_value={'hashcat': 'test'})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_split_status_and_non_json_messages(self):
         with tempfile.TemporaryDirectory() as temp:
             log = Path(temp) / 'log'
@@ -101,6 +106,8 @@ class TaskStorage(unittest.TestCase):
                           dictionary_sha256=hashlib.sha256(dictionary.read_bytes()).hexdigest(),
                           input_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
                           command=['hashcat', '-m', '22000', str(source), str(dictionary)])
+            record['command'] = build_command(record, job)
+            fixtures.write_restore(job / 'hashcat.restore', job, record['command'])
             with patch('wifi_hashcat.subprocess.run', return_value=types.SimpleNamespace(stdout='--restore')):
                 self.assertIn('--restore', resume_command(record, job))
             with patch('wifi_hashcat.subprocess.run', return_value=types.SimpleNamespace(stdout='--restore-position')):
