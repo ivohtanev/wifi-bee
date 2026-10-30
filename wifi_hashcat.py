@@ -1,4 +1,4 @@
-"""Explicit dictionary runs over verified, exported WPA 22000 records."""
+"""Dictionary and installed-mask runs over verified WPA 22000 exports."""
 import curses
 import datetime as dt
 import fcntl
@@ -17,8 +17,9 @@ from wifi_analysis import fingerprint, select
 
 
 from wifi_storage import (secure, atomic_json, writable_directory, durable_touch,
-                          bar, duration, size)
-from wifi_wordlists import dictionaries, browse as browse_wordlists
+                          bar, duration)
+from wifi_wordlists import dictionaries, dictionary_label, browse as browse_wordlists
+from wifi_ui import footer
 
 
 def load_dataset(folder):
@@ -40,7 +41,7 @@ def explain(code):
         -signal.SIGINT: 'Задачата е спряна от потребителя. Резултатите са запазени; възобнови от наличния checkpoint.',
         -signal.SIGTERM: 'Процесът е прекратен. Резултатите остават; провери наличието на checkpoint.',
         0: 'Hashcat приключи успешно. Виж recovered.txt за намерените записи.',
-        1: 'Речникът е изчерпан. Възможно е да има частичен успех; виж recovered.txt. Това не доказва, че паролата е невъзстановима.',
+        1: 'Избраното пространство от кандидати е изчерпано. Възможно е да има частичен успех; виж recovered.txt. Това не доказва, че паролата е невъзстановима.',
         2: 'Задачата е прекратена. Вече намерените резултати са запазени.',
         3: 'Задачата е прекратена при checkpoint.',
         4: 'Достигнат е времевият лимит.',
@@ -56,8 +57,9 @@ def text_input(screen, write, title):
         write(screen, 0, title, curses.A_BOLD)
         write(screen, 2, 'Пълен път • Enter избира • Esc отказва')
         write(screen, 4, value.decode('utf-8', errors='replace')[-max(1, screen.getmaxyx()[1] - 3):])
+        footer(screen, 'Текст: път (малко h) • Enter избира • Esc отказ • F1 помощ')
         screen.refresh()
-        key = screen.getch()
+        key = getattr(screen, 'read_text_key', screen.getch)()
         if key == 27:
             return None
         if key in (10, 13, curses.KEY_ENTER):
@@ -151,7 +153,7 @@ def resume_command(metadata, job):
     dictionary = Path(metadata['dictionary'])
     source = job / 'input.22000'
     if not metadata.get('dictionary_sha256') or fingerprint(dictionary) != metadata['dictionary_sha256']:
-        raise ValueError('Речникът липсва или е променен. Върни оригиналния файл преди възобновяване.')
+        raise ValueError('Речникът/маската липсва или е променен. Върни оригиналния файл преди възобновяване.')
     if fingerprint(source) != metadata['input_sha256']:
         raise ValueError('Входните WPA записи са променени. Не може безопасно да се възобнови.')
     restore = job / 'hashcat.restore'
@@ -166,7 +168,7 @@ def resume_command(metadata, job):
 
 def draw_run(screen, write, metadata, status, reader, results, job):
     screen.erase()
-    write(screen, 0, 'Hashcat • речникова проверка', curses.A_BOLD)
+    write(screen, 0, 'Hashcat • ' + ('маски' if metadata.get('attack_mode') == 3 else 'речникова проверка'), curses.A_BOLD)
     progress = status.get('progress', [0, 0])
     done, total = progress
     rejected = status.get('rejected', 0)
@@ -175,7 +177,7 @@ def draw_run(screen, write, metadata, status, reader, results, job):
     stop = status.get('estimated_stop', 0)
     eta = max(0, stop - time.time()) if stop > 1 else None
     recovered = status.get('recovered_hashes', [metadata.get('recovered', 0), metadata['records']])
-    lines = ['Речник: ' + Path(metadata['dictionary']).name,
+    lines = [('Маска: ' if metadata.get('attack_mode') == 3 else 'Речник: ') + Path(metadata['dictionary']).name,
              bar(done, total),
              f'Обработени: {done:,} / {total:,} • отхвърлени: {rejected:,}',
              f'Проверки (без отхвърлените): {max(0, done - rejected):,} • {speed:,.0f} H/s',
@@ -204,15 +206,19 @@ def draw_run(screen, write, metadata, status, reader, results, job):
     for message in reader.messages[-2:]:
         write(screen, row, ''.join(c if c.isprintable() else ' ' for c in message))
         row += 1
+    footer(screen, 'S/Q/Esc стоп с потвърждение • статистика се обновява автоматично')
     screen.refresh()
 
 
-def execute(screen, session, write, folder, dictionary, resume_job=None):
+def execute(screen, session, write, folder, dictionary, resume_job=None, attack_mode=0):
+    if attack_mode not in (0, 3):
+        raise ValueError('Неподдържан режим на проверка.')
     base = session.destination.parent.resolve()
     if not shutil.which('hashcat'):
         raise ValueError('hashcat не е инсталиран или не е в PATH. Инсталирай hashcat и GPU/OpenCL драйвера.')
     screen.erase()
     write(screen, 0, 'Подготовка: проверка на файловете, SHA-256 и запис на диска…')
+    footer(screen, 'Подготовка на hashcat • изчакай')
     screen.refresh()
     jobs = base / 'data' / 'hashcat'
     log_dir = base / 'log'
@@ -222,7 +228,7 @@ def execute(screen, session, write, folder, dictionary, resume_job=None):
         manifest, hashes, count = load_dataset(folder)
         dictionary = dictionary.resolve()
         if not dictionary.is_file() or dictionary.stat().st_size == 0:
-            raise ValueError('Речникът липсва или е празен. Нужен е текстов файл с по една кандидат-парола на ред.')
+            raise ValueError('Входният файл липсва или е празен. Нужен е текстов речник или .hcmask файл.')
         with dictionary.open('rb') as stream:
             sample = stream.read(8192)
         if b'\x00' in sample or sample.startswith((b'\x1f\x8b', b'PK\x03\x04')):
@@ -235,13 +241,15 @@ def execute(screen, session, write, folder, dictionary, resume_job=None):
         if fingerprint(source) != manifest['outputs']['wpa.22000']:
             raise ValueError('Наборът е променен по време на подготовката.')
         shutil.copyfile(folder / 'manifest.json', job / 'source-manifest.json')
-        command = ['hashcat', '-m', '22000', '-a', '0', '-w', '1', '--status', '--status-json',
+        command = ['hashcat', '-m', '22000', '-a', str(attack_mode), '-w', '1', '--status', '--status-json',
                    '--status-timer', '1', '--session', 'wifi-' + run_id,
                    '--restore-file-path', str(job / 'hashcat.restore'),
                    '--potfile-path', str(job / 'hashcat.potfile'),
                    '--outfile', str(job / 'recovered.txt'), '--outfile-format', '1,2',
                    str(source), str(dictionary)]
-        metadata = {'id': run_id, 'dataset': str(folder), 'source_id': manifest['id'],
+        if attack_mode == 3 and dictionary.name == 'hashcat-default.hcmask':
+            command += ['--increment', '--increment-min', '8', '--increment-max', '15']
+        metadata = {'attack_mode': attack_mode, 'id': run_id, 'dataset': str(folder), 'source_id': manifest['id'],
                     'dictionary': str(dictionary), 'dictionary_sha256': fingerprint(dictionary),
                     'input_sha256': fingerprint(source), 'command': command, 'records': count,
                     'started': time.time(), 'status': 'starting', 'results': str(job / 'recovered.txt')}
@@ -344,7 +352,7 @@ def execute(screen, session, write, folder, dictionary, resume_job=None):
 def browse(screen, session, write):
     base = session.destination.parent
     while True:
-        choice = select(screen, 'Hashcat', ['Нова речникова проверка', 'Предишни задачи / резултати / възобновяване', 'Изтегли речници', 'Назад'], write)
+        choice = select(screen, 'Hashcat', ['Нова проверка', 'Предишни задачи / резултати / възобновяване', 'Изтегли речници', 'Назад'], write)
         if choice is None or choice == 3:
             return
         try:
@@ -361,7 +369,7 @@ def browse(screen, session, write):
                                     ['Назад', 'Възобнови от checkpoint', 'Покажи намерени пароли'], write,
                                     [record.get('message', record['status']), f'Намерени: {record.get("recovered", 0)}',
                                      'Лог: ' + record['log'], 'Резултати: ' + record['results'],
-                                     'Речник: ' + record['dictionary'],
+                                     ('Маска: ' if record.get('attack_mode') == 3 else 'Речник: ') + record['dictionary'],
                                      'Checkpoint: ' + ('наличен' if (job / 'hashcat.restore').exists() else 'няма'),
                                      'Статусът running след авария може да е остарял; проверяваме заключването.'])
                     if action == 1:
@@ -378,7 +386,7 @@ def browse(screen, session, write):
             labels = []
             for path in datasets:
                 data = json.loads(path.read_text())
-                labels.append(f'{path.parent.name} • {data.get("converter_accepted_records", "?")} записа • ' +
+                labels.append(f'Готов набор ({path.parent.name}/wpa.22000) • {data.get("converter_accepted_records", "?")} записа • серии: ' +
                               ', '.join(Path(x['path']).name.split('_')[0] for x in data.get('sources', []))[:60])
             idx = select(screen, 'Избери готов набор', labels or ['Няма готови данни — използвай Анализ → извлечи готови'], write)
             if not datasets or idx is None:
@@ -386,22 +394,36 @@ def browse(screen, session, write):
             folder = datasets[idx].parent
             load_dataset(folder)
             available = dictionaries(base)
-            idx = select(screen, 'Избери речник', [p.name + ' • ' + size(p.stat().st_size) for p in available] + ['Въведи път до речник'], write)
+            masks = installed_masks()
+            labels = [dictionary_label(p) for p in available]
+            labels += [label for path, label in masks]
+            idx = select(screen, 'Избери речник или автоматични комбинации',
+                         labels + ['Въведи път до речник'], write,
+                         ['Речник: проверява думите от файла. Маска: генерира комбинации без речник.',
+                          'Показват се само инсталираните .hcmask файлове на hashcat.',
+                          'Маските следват своя шаблон; някои могат да работят изключително дълго.'])
             if idx is None:
                 continue
-            if idx == len(available):
+            attack_mode = 0
+            if idx == len(labels):
                 value = text_input(screen, write, 'Речник: една кандидат-парола на ред')
                 if not value:
                     continue
                 dictionary = Path(value).expanduser().resolve()
-            else:
+            elif idx < len(available):
                 dictionary = available[idx]
+            else:
+                dictionary = masks[idx - len(available)][0]
+                attack_mode = 3
             if select(screen, 'Подготовка на проверката', ['Назад', 'Старт'], write,
-                      ['Режим 22000 • речник • ниско натоварване (-w 1)',
+                      ['Режим 22000 • ' + ('маска (генерирани комбинации)' if attack_mode == 3 else 'речник') + ' • ниско натоварване (-w 1)',
                        'Съвпадение потвърждава WPA записа, не текущата парола на рутера.',
-                       'Hashcat спира след всички намерени записи или изчерпан речник.', 'Данни: ' + str(folder),
-                       'Речник: ' + str(dictionary), 'Намерени пароли → data/hashcat/<задача>/recovered.txt']) == 1:
-                execute(screen, session, write, folder, dictionary)
+                       'Спира след всички намерени записи или изчерпване на кандидатите.',
+                       ('Маските могат да отнемат години; виж напредъка и спри със S.' if attack_mode == 3 else 'Проверява само кандидатите в избрания файл.'),
+                       'Данни: ' + str(folder), 'Файл: ' + str(dictionary),
+                       'Намерени пароли → data/hashcat/<задача>/recovered.txt']) == 1:
+                execute(screen, session, write, folder, dictionary, attack_mode=attack_mode)
+
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
             logging.getLogger('wifi').exception('Hashcat workflow failed')
             error_log = base / 'log' / ('hashcat-error-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6] + '.log')
@@ -414,3 +436,23 @@ def browse(screen, session, write):
             select(screen, 'Hashcat не може да продължи', ['Назад'], write,
                    [str(exc), 'Провери свободното място, правата и формата на файловете.',
                     'При GPU грешка: провери драйвера с hashcat -I.', 'Подробности: ' + str(error_log)])
+
+
+def installed_masks():
+    """Discover package-provided masks; never pretend an absent preset exists."""
+    roots = [Path('/usr/share/hashcat/masks'), Path('/usr/local/share/hashcat/masks')]
+    executable = shutil.which('hashcat')
+    if executable:
+        roots.append(Path(executable).resolve().parent / 'masks')
+    titles = {
+        'hashcat-default': 'Автоматични комбинации — стандартна маска на Hashcat, 8–15 знака',
+        '8char-1l-1u-1d-1s-compliant': 'Маска — 8 знака с малка/главна буква, цифра и символ',
+        '8char-1l-1u-1d-1s-noncompliant': 'Маски — други комбинации от 8 знака',
+    }
+    found = {}
+    for root in roots:
+        for path in sorted(root.glob('*.hcmask')):
+            if path.is_file() and path.stat().st_size:
+                title = titles.get(path.stem, 'Маски — ' + path.stem.replace('-', ' '))
+                found.setdefault(path.name, (path, f'{title} ({path.name})'))
+    return sorted(found.values(), key=lambda item: (item[0].name != 'hashcat-default.hcmask', item[0].name))

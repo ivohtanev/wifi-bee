@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 
-from wifi_ui import guarded_ui
+from wifi_ui import guarded_ui, footer
 from wifi_hashcat import browse as browse_hashcat
 from wifi_wordlists import browse as browse_wordlists
 from wifi_live import LiveSummary, device_label, signal_label, auth_label
@@ -280,6 +280,7 @@ def choose_channel(screen, session, normal, highlight):
         for index in range(first, min(len(options), first + count)):
             label = ('▶ ' if index == selected else '  ') + options[index]
             write(screen, 4 + index - first, label.ljust(max(0, width - 2)), highlight if index == selected else normal)
+        footer(screen, '↑/↓ избор • Enter избира канал • Q/Esc назад')
         screen.refresh()
         key = screen.getch()
         if key == curses.KEY_UP:
@@ -295,6 +296,7 @@ def choose_channel(screen, session, normal, highlight):
                 screen.erase()
                 write(screen, 1, 'Номер на канал (празно = отказ):')
                 write(screen, 3, 'Поддържани: ' + ', '.join(map(str, sorted(channels))))
+                footer(screen, 'Цифри: канал • Enter потвърждава • Esc отказ')
                 screen.timeout(-1)
                 curses.echo()
                 curses.curs_set(1)
@@ -390,6 +392,8 @@ def ui(screen, session):
                           f'{counts["packets"]} pkt • {auth}', attr)
                 write(screen, height - 4, status)
         write(screen, screen.getmaxyx()[0] - 3, session.error or message)
+        footer(screen, '↑/↓ избор • Enter избира • Q/Esc назад/изход' +
+               (' • PgUp/PgDn устройства' if page == 'capture' else ''))
         screen.refresh()
         key = screen.getch()
         if key in (curses.KEY_NPAGE, curses.KEY_PPAGE) and page == 'capture':

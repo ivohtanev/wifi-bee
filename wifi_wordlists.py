@@ -13,6 +13,7 @@ import urllib.request
 import uuid
 
 from wifi_analysis import select
+from wifi_ui import footer
 from wifi_storage import atomic_json, bar, duration, secure, size, sync_directory, writable_directory
 
 CATALOG = Path(__file__).with_name('wordlist_catalog.json')
@@ -164,6 +165,7 @@ def download(screen, session, write, entry):
                      'Ръчно изтегляне: ' + str(help_file)]
             for row, line in enumerate(lines):
                 write(screen, row + 1, line)
+            footer(screen, 'Q/Esc отказва изтеглянето')
             screen.refresh()
             if screen.getch() in (27, ord('q'), ord('Q')):
                 cancel.set()
@@ -178,7 +180,7 @@ def download(screen, session, write, entry):
     else:
         select(screen, 'Речникът е готов', ['Назад'], write,
                [str(folder / entry['filename']), f'{entry["lines"]:,} реда • {size(entry["installed_bytes"])}',
-                'SHA-256 проверен. Достъпен в Hashcat → Нова речникова проверка.'])
+                'SHA-256 проверен. Достъпен в Hashcat → Нова проверка.'])
 
 
 def browse(screen, session, write):
@@ -186,7 +188,8 @@ def browse(screen, session, write):
     while True:
         try:
             entries = catalog()
-            labels = [f'[{e["category"]}] {size(e["bytes"])} → {size(e["installed_bytes"])} • {e["name"]}' +
+            labels = [f'{e["name"]} ({e["filename"]}) • [{e["category"]}] ' +
+                      f'{size(e["bytes"])} → {size(e["installed_bytes"])}' +
                       (' • наличен' if (base / 'wordlists' / e['filename']).is_file() else '') for e in entries]
             idx = select(screen, 'Речници • изтегляне', labels + ['Назад'], write,
                          ['Enter изтегля • размер: за теглене → готов файл • SHA-256 проверка',
@@ -206,3 +209,9 @@ def browse(screen, session, write):
             logging.getLogger('wifi').exception('Wordlist catalog failed')
             select(screen, 'Грешка при речниците', ['Назад'], write,
                    [str(exc), 'Провери права и свободно място. Подробности: log/wifi-console.log'])
+
+
+def dictionary_label(path):
+    entry = next((e for e in catalog() if e['filename'] == path.name), None)
+    title = entry['name'] if entry else path.stem.replace('_', ' ').replace('-', ' ')
+    return f'{title} ({path.name}) • {size(path.stat().st_size)}'

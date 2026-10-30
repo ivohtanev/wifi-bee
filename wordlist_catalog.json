@@ -124,5 +124,33 @@
     "installed_bytes": 1582880,
     "installed_sha256": "10530ad89bb383d7147b16f0d8d5448c596c3686269d36c90aabe3e037c3b7d0",
     "lines": 157248
+  },
+  {
+    "id": "pwdb-10m",
+    "category": "Големи / смесени",
+    "name": "Pwdb — 10 милиона",
+    "url": "https://raw.githubusercontent.com/danielmiessler/SecLists/cb6d7645abf4a2c467bc80f84cf70bda3d60c2d6/Passwords/Common-Credentials/Pwdb_top-10000000.txt",
+    "source": "https://github.com/danielmiessler/SecLists/blob/cb6d7645abf4a2c467bc80f84cf70bda3d60c2d6/Passwords/Common-Credentials/Pwdb_top-10000000.txt",
+    "filename": "pwdb-10m.txt",
+    "bytes": 94461698,
+    "sha256": "18dc49ca32b62455a61e3398f4ab9f93eb700ff142fa0d4b9fd11a727f3b80e4",
+    "filter": "all",
+    "installed_bytes": 94461698,
+    "installed_sha256": "18dc49ca32b62455a61e3398f4ab9f93eb700ff142fa0d4b9fd11a727f3b80e4",
+    "lines": 10000000
+  },
+  {
+    "id": "xato-full",
+    "category": "Големи / смесени",
+    "name": "Xato — пълен списък, 5,2 милиона",
+    "url": "https://raw.githubusercontent.com/danielmiessler/SecLists/cb6d7645abf4a2c467bc80f84cf70bda3d60c2d6/Passwords/Common-Credentials/xato-net-10-million-passwords.txt",
+    "source": "https://github.com/danielmiessler/SecLists/blob/cb6d7645abf4a2c467bc80f84cf70bda3d60c2d6/Passwords/Common-Credentials/xato-net-10-million-passwords.txt",
+    "filename": "xato-full.txt",
+    "bytes": 48312893,
+    "sha256": "c95989fecfae9c91aa9f5c730344d5cabd6335bb094c9c60aba16bf1742a72fe",
+    "filter": "all",
+    "installed_bytes": 48312893,
+    "installed_sha256": "c95989fecfae9c91aa9f5c730344d5cabd6335bb094c9c60aba16bf1742a72fe",
+    "lines": 5189454
   }
 ]

@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import time
 
+from wifi_ui import footer
+
 VERSION = 1
 
 
@@ -124,6 +126,7 @@ def select(screen, title, options, write, details=()):
             write(screen, top + i - first, ('▶ ' if i == selected else '  ') + options[i],
                   curses.A_REVERSE if i == selected else 0)
         write(screen, height - 2, f'{selected + 1}/{len(options)}')
+        footer(screen, '↑/↓ избор • Enter избира • Q/Esc назад • PgUp/PgDn страница')
         screen.refresh()
         key = screen.getch()
         if key in (27, ord('q'), ord('Q')):
@@ -143,6 +146,7 @@ def inspect(screen, paths, base, session, write):
                 screen.erase()
                 write(screen, 0, f'Анализ на {len(paths)} файла…', curses.A_BOLD)
                 write(screen, 2, 'hcxpcapngtool + tshark • изчакване на резултата')
+                footer(screen, 'Анализът работи • изчакай резултата')
                 screen.refresh()
                 screen.getch()
             report = future.result()
@@ -183,7 +187,7 @@ def browse(screen, session, write):
             return
         paths = groups[keys[choice]]
         while True:
-            file_choice = select(screen, 'Серия ' + keys[choice], ['Всички от серията'] + [p.name for p in paths], write)
+            file_choice = select(screen, 'Серия ' + keys[choice], ['Всички от серията'] + [f'Запис на трафик ({p.name})' for p in paths], write)
             if file_choice is None:
                 break
             try:
