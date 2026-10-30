@@ -1,3 +1,4 @@
+from wifi_ui import navigation
 """Persistent network inventory; original manifests and run files remain authoritative."""
 import hashlib
 import json
@@ -115,6 +116,7 @@ def previous(base, session, hashes, candidate=None, attack_mode=0):
     return lines
 
 
+@navigation('Мрежи и история')
 def browse(screen, session, write):
     from wifi_analysis import select
     base = session.destination.parent

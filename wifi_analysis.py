@@ -1,3 +1,4 @@
+from wifi_ui import navigation, capture_location, breadcrumb
 import logging
 """Offline capture inventory, analysis and provenance-aware exports."""
 import concurrent.futures
@@ -13,6 +14,7 @@ import tempfile
 import time
 import textwrap
 
+from wifi_capture_info import summary as capture_summary, journal_details
 from wifi_network_history import inventory, synchronize
 from wifi_ui import footer
 from wifi_process import Processes
@@ -125,18 +127,19 @@ def export(base, folder, report, category, session):
     return target
 
 
-def select(screen, title, options, write, details=(), hotkeys=None):
-    selected = 0
+def select(screen, title, options, write, details=(), hotkeys=None, initial_selected=0):
+    selected = initial_selected
     detail_offset = 0
     while True:
         screen.erase()
         height, width = screen.getmaxyx()
-        write(screen, 0, title, curses.A_BOLD)
+        write(screen, 0, breadcrumb(title), curses.A_BOLD)
         write(screen, 1, '↑/↓ избор • Enter • Q назад • PgUp/PgDn')
         items = list(options() if callable(options) else options)
         implicit_back = 'Назад' not in items
         if implicit_back:
             items.append('Назад')
+        selected = max(0, min(selected, len(items) - 1))
         wrapped = [part for line in details for part in (textwrap.wrap(str(line), max(1, width - 4)) or [''])]
         # Reserve room for the list even on short terminals.
         detail_rows = max(0, min(7, height - 7))
@@ -166,6 +169,7 @@ def select(screen, title, options, write, details=(), hotkeys=None):
         selected = max(0, min(len(items) - 1, selected + step))
 
 
+@navigation(lambda a: 'Анализ на файлове • ' + capture_location(a))
 def inspect(screen, paths, base, session, write):
     with tempfile.TemporaryDirectory(prefix='wifi-analysis-') as temp:
         folder = Path(temp)
@@ -212,11 +216,13 @@ def inspect(screen, paths, base, session, write):
 ARCHIVE_KEYS = {ord('k'): 'open_archive', ord('K'): 'open_archive', ord('a'): 'archive', ord('A'): 'archive'}
 
 
+@navigation(lambda a: 'Анализ' + (' › Архив' if a['archived'] else ''))
 def browse(screen, session, write, archived=False):
     base = session.destination.parent
     digest_cache = {}
     readiness = {}
     root = archive_folder(base, 'captures', session) if archived else session.destination
+    cursor = 0
     while True:
         groups = {}
         for path in sorted(root.glob('*.pcapng')):
@@ -255,11 +261,14 @@ def browse(screen, session, write, archived=False):
         try:
             choice = select(screen, 'Анализ • ' + ('архив' if archived else 'серии'), labels, write,
                             ['A върху запис: ' + ('възстанови' if archived else 'архивирай веднага') +
-                             ' • Enter отваря' + ('' if archived else ' • K отваря Архив')], hotkeys=ARCHIVE_KEYS)
+                             ' • Enter отваря' + ('' if archived else ' • K отваря Архив')], hotkeys=ARCHIVE_KEYS,
+                            initial_selected=min(cursor, max(0, len(keys) - 1)))
         finally:
             processes.close()
             pool.shutdown(wait=True, cancel_futures=True)
         action, selected = choice if isinstance(choice, tuple) else ('open', choice)
+        if selected is not None:
+            cursor = selected
         if action == 'open_archive':
             if not archived:
                 browse(screen, session, write, archived=True)
@@ -280,21 +289,30 @@ def browse(screen, session, write, archived=False):
             select(screen, 'Операцията не завърши', ['Назад'], write, [str(exc), 'Нищо не се презаписва. Завършените местения остават в целта.'])
 
 
+@navigation(capture_location)
 def browse_series(screen, session, write, paths, archived, digest_cache):
     base = session.destination.parent
+    cursor = 0
     while paths:
         extracted = extracted_paths(paths, extracted_index(base), digest_cache)
         file_choice = select(screen, 'Серия • ' + ('архив' if archived else 'записи'),
-                             ['Всички от серията'] + [f'Запис на трафик ({p.name})' + (' [Извлечени]' if p in extracted else '') for p in paths],
-                             write, ['A: ' + ('възстанови избраното' if archived else 'архивирай избраното веднага')], hotkeys=ARCHIVE_KEYS)
+                             ['Всички от серията'] + [f'Запис на трафик ({p.name})' + (' [Извлечени]' if p in extracted else '') for p in paths] + ['Статистика monitor / устройства (цялата серия)'],
+                             write, ['A: ' + ('възстанови избраното' if archived else 'архивирай избраното веднага')], hotkeys=ARCHIVE_KEYS,
+                             initial_selected=min(cursor, len(paths)))
         action, selected = file_choice if isinstance(file_choice, tuple) else ('open', file_choice)
+        if selected is not None:
+            cursor = selected
         if action == 'open_archive':
             if not archived:
                 browse(screen, session, write, archived=True)
             paths = [p for p in paths if p.exists()]
             continue
-        if selected is None or selected > len(paths):
+        if selected is None or selected > len(paths) + 1:
             return
+        if selected == len(paths) + 1:
+            if action == 'open':
+                show_capture_info(screen, session, write, paths)
+            continue
         chosen = paths if selected == 0 else [paths[selected - 1]]
         if action == 'archive':
             move_captures(base, chosen, session, restore=archived)
@@ -317,3 +335,23 @@ def series_ready(paths, processes=None):
             return out.is_file() and out.stat().st_size > 0
     except (OSError, RuntimeError, subprocess.SubprocessError):
         return None
+
+
+@navigation(lambda a: 'Статистика monitor • ' + capture_location(a))
+def show_capture_info(screen, session, write, paths):
+    processes = Processes()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(capture_summary, paths, processes)
+    try:
+        while not future.done():
+            screen.erase()
+            write(screen, 0, 'Четене на monitor файловете…', curses.A_BOLD)
+            footer(screen, 'Q/Esc отказ • анализ само при поискване')
+            screen.refresh()
+            if screen.getch() in (27, ord('q'), ord('Q')):
+                return
+        details = journal_details(session.destination.parent, paths) + future.result()
+        select(screen, 'Статистика monitor / устройства', ['Назад'], write, details)
+    finally:
+        processes.close()
+        pool.shutdown(wait=True, cancel_futures=True)
